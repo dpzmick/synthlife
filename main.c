@@ -23,7 +23,7 @@ uint64_t fmix64(uint64_t k)
 static atomic_bool running;
 
 // both square
-#define WINDOW_SIZE 2048
+#define WINDOW_SIZE 1024
 #define N_CELLS     512
 
 static_assert(WINDOW_SIZE % N_CELLS == 0, "Window Size must evenly divide number of cells");
@@ -39,7 +39,7 @@ static struct SDL_Rect const* temp_cell_rect(int x, int y)
   return &rect;
 }
 
-bool alive_next_cycle(bool* cells, size_t my_x, size_t my_y)
+int alive_next_cycle(int* cells, size_t my_x, size_t my_y)
 {
   static ssize_t xoffs[3] = {-1, 0, 1};
   static ssize_t yoffs[3] = {-1, 0, 1};
@@ -120,15 +120,17 @@ int main(void)
   size_t which   = 0;
 
   // initialize with random values
-  uint64_t r = 0xdeadbeef;
+  uint64_t r = 0xcafebabe;
   for (size_t i = 0; i < N_CELLS*N_CELLS; ++i) {
     r = fmix64(r ^ i);
-    arrs[which][i] = r > INT64_MAX/2;
+    arrs[which][i] = r > INT64_MAX/4;
   }
 
   float    fps         = 60.;
+  float    fps2        = 60.;
   uint64_t last_update = 0;
   SDL_Surface* surfaceMessage = NULL;
+  SDL_Surface* surfaceMessage2 = NULL;
 
   char fps_buffer[1024];
   atomic_store(&running, true);
@@ -145,6 +147,7 @@ int main(void)
         }
       }
     }
+    uint64_t stop_render = wallclock();
 
     size_t next = which == 1 ? 1 : 0;
     for (size_t x = 0; x < N_CELLS; ++x) {
@@ -154,8 +157,13 @@ int main(void)
     }
     which = next;
 
-    if (surfaceMessage)
+    if (surfaceMessage) {
       SDL_BlitSurface(surfaceMessage, NULL, s, &(struct SDL_Rect){.x = 0, .y = 0, .h = 20, .w = 20});
+    }
+
+    if (surfaceMessage2) {
+      SDL_BlitSurface(surfaceMessage2, NULL, s, &(struct SDL_Rect){.x = 0, .y = 20, .h = 20, .w = 20});
+    }
 
     SDL_UpdateWindowSurface(w);
     // SDL_Delay(5);
@@ -171,8 +179,14 @@ int main(void)
       fps = (0.7)*this_frame - (1. - 0.7)*fps;
       sprintf(fps_buffer, "fps: %.3f", fps);
       surfaceMessage = TTF_RenderText_Solid(font, fps_buffer, white);
+
+      fps2 = (0.7)*(1e9 / (stop_render - start)) - (1. - 0.7)*fps;
+      sprintf(fps_buffer, "fps: %.3f", fps2);
+      surfaceMessage2 = TTF_RenderText_Solid(font, fps_buffer, white);
       last_update = stop;
     }
+
+    SDL_Delay(500);
   }
 
   SDL_DestroyWindow(w);
