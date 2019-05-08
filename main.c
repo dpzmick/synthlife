@@ -26,13 +26,13 @@ uint64_t fmix64(uint64_t k)
 static atomic_bool running;
 
 // both square
-#define WINDOW_SIZE 2048
-#define N_CELLS     1024
+#define WINDOW_SIZE 1400
+#define N_CELLS     (WINDOW_SIZE/2)
 
 static_assert(WINDOW_SIZE % N_CELLS == 0, "Window Size must evenly divide number of cells");
 #define CELL_SIZE (WINDOW_SIZE / N_CELLS)
 
-#define MIN_LIFESPAN 400
+#define MIN_LIFESPAN 501
 #define MAX_LIFESPAN 800
 
 static struct SDL_Rect const* temp_cell_rect(int x, int y)
@@ -45,6 +45,7 @@ static struct SDL_Rect const* temp_cell_rect(int x, int y)
   return &rect;
 }
 
+#ifdef JACK
 typedef struct {
   jack_port_t * young;
   jack_port_t * middle_aged;
@@ -71,6 +72,7 @@ static int proc_audio(jack_nframes_t nframes, void* arg)
 
   return 0;
 }
+#endif // JACK
 
 static int alive_next_cycle(int* cells, size_t my_x, size_t my_y)
 {
@@ -108,7 +110,7 @@ static int alive_next_cycle(int* cells, size_t my_x, size_t my_y)
     /* otherwise */           return ++curr;
   }
   else {
-    if (alive_neighbors == 3) return 1;
+    if (alive_neighbors == 4) return 1;
     else                      return 0;
   }
 
@@ -140,8 +142,8 @@ int main(void)
     return 1;
   }
 
-  TTF_Font* font = TTF_OpenFont("/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf", 20);
-  SDL_Color white = {0, 255, 0};
+  TTF_Font* font = TTF_OpenFont("/usr/share/fonts/TTF/Inconsolata-Regular.ttf", 18);
+  SDL_Color white = {255, 255, 255};
   if (!font) {
     printf("Could not open font! TTF_Error: %s\n", TTF_GetError());
     return 1;
@@ -159,6 +161,11 @@ int main(void)
     return 1;
   }
 
+  volatile float ayf  = 0.0; // what a mess!
+  volatile float amaf = 0.0;
+  volatile float aof  = 0.0;
+
+#ifdef JACK
   jack_client_t * cl = jack_client_open("life", JackNoStartServer, NULL);
   if (!cl) {
     printf("Failed to open jack client\n");
@@ -182,10 +189,6 @@ int main(void)
     printf("Failed to create young port\n");
     return 1;
   }
-
-  volatile float ayf  = 0.0; // what a mess!
-  volatile float amaf = 0.0;
-  volatile float aof  = 0.0;
 
   int ret = jack_set_process_callback(cl, proc_audio, &(args_t){
       .young       = young,
@@ -222,6 +225,7 @@ int main(void)
     printf("Failed to set process callback\n");
     return 1;
   }
+#endif // JACK
 
   // double buffer
   int*   arrs[2] = {arr1, arr2};
@@ -238,13 +242,10 @@ int main(void)
   float    fps2        = 60.;
   uint64_t last_update = 0;
   SDL_Surface* surfaceMessage = NULL;
-  SDL_Surface* surfaceMessage2 = NULL;
-
-  uint64_t end_bucket_young = MAX_LIFESPAN/3;
-  uint64_t end_bucket_ma    = MAX_LIFESPAN/3 + MAX_LIFESPAN/3;
 
   char fps_buffer[1024];
   atomic_store(&running, true);
+  double average_age = MAX_LIFESPAN/2; // sort of
   while (atomic_load(&running)) {
     uint64_t start = wallclock();
     s = SDL_GetWindowSurface(w);
@@ -257,24 +258,35 @@ int main(void)
     size_t next = which == 1 ? 1 : 0;
     for (size_t x = 0; x < N_CELLS; ++x) {
       for (size_t y = 0; y < N_CELLS; ++y) {
-        int n = arrs[which][x+y*N_CELLS];
-        if (n < end_bucket_young)   yf  += 1;
-        else if (n < end_bucket_ma) maf += 1;
-        else                        of  += 1;
-
-        arrs[next][x + y*N_CELLS] = alive_next_cycle(arrs[which], x, y);
-
-        // draw
+        int   n      = arrs[which][x+y*N_CELLS];
         int   mmm    = 200;
         float factor = ((float)mmm/((float)(MAX_LIFESPAN)));
-        int   c      = MIN(arrs[which][x+y*N_CELLS], MAX_LIFESPAN)*factor;
+        int   c      = MIN(n, MAX_LIFESPAN)*factor;
+
+        double end_bucket_young = average_age/5;
+        double end_bucket_ma    = end_bucket_young*4;
+
         assert(c <= 255);
-        if (c > 3*(mmm/4)) {
-          SDL_FillRect(s, temp_cell_rect(x*CELL_SIZE, y*CELL_SIZE), SDL_MapRGB(s->format, 0.9*c, 0.2*c, 0.2*c));
+        if (n < end_bucket_young) {
+          yf  += 1;
+          SDL_FillRect(s, temp_cell_rect(x*CELL_SIZE, y*CELL_SIZE), SDL_MapRGB(s->format, 0.3*c, 0.3*c, 0.8*c));
+        }
+        else if (n < end_bucket_ma) {
+          maf += 1;
+          SDL_FillRect(s, temp_cell_rect(x*CELL_SIZE, y*CELL_SIZE), SDL_MapRGB(s->format, 0.35*c, 0.25*c, 0.7*c));
         }
         else {
-          SDL_FillRect(s, temp_cell_rect(x*CELL_SIZE, y*CELL_SIZE), SDL_MapRGB(s->format, 0.2*c, 0.3*c, 0.8*c));
+          of  += 1;
+          if (n < MIN_LIFESPAN) {
+            SDL_FillRect(s, temp_cell_rect(x*CELL_SIZE, y*CELL_SIZE), SDL_MapRGB(s->format, 0.35*c, 0.25*c, 0.7*c));
+          }
+          else {
+            SDL_FillRect(s, temp_cell_rect(x*CELL_SIZE, y*CELL_SIZE), SDL_MapRGB(s->format, 0.8*c, 0.2*c, 0.4*c));
+          }
         }
+
+        arrs[next][x + y*N_CELLS] = alive_next_cycle(arrs[which], x, y);
+        average_age = (0.1)*(arrs[next][x+y*N_CELLS]) + (1 - 0.1)*average_age;
       }
     }
     yf  /= N_CELLS*N_CELLS;
@@ -294,12 +306,35 @@ int main(void)
     which = next;
 
     if (surfaceMessage) {
-      SDL_BlitSurface(surfaceMessage, NULL, s, &(struct SDL_Rect){.x = 0, .y = 0, .h = 20, .w = 20});
+      SDL_BlitSurface(surfaceMessage, NULL, s, &(struct SDL_Rect){.x = 0, .y = 0, .h = 10, .w = 20});
     }
 
-    if (surfaceMessage2) {
-      SDL_BlitSurface(surfaceMessage2, NULL, s, &(struct SDL_Rect){.x = 0, .y = 20, .h = 20, .w = 20});
-    }
+    float bar_chart_scale = 100 /* px */;
+
+    char b2[1024];
+    sprintf(b2, "avg: %.3f", average_age);
+    SDL_Surface* label = TTF_RenderText_Blended(font, b2, white);
+    SDL_BlitSurface(label, NULL, s, &(struct SDL_Rect){.x = 0, .y = WINDOW_SIZE-100, .h = 10, .w = 20});
+    SDL_FreeSurface(label);
+
+    // FIXME don't allcocate and free in render loop dummy
+    label = TTF_RenderText_Blended(font, "Young", white);
+    SDL_BlitSurface(label, NULL, s, &(struct SDL_Rect){.x = 56, .y = WINDOW_SIZE-80, .h = 10, .w = 20});
+    SDL_FreeSurface(label);
+
+    SDL_FillRect(s, &(struct SDL_Rect){.x = 110, .y = WINDOW_SIZE-70, .h = 10, .w = bar_chart_scale*yf}, SDL_MapRGB(s->format, 0xFF, 0xFF, 0xFF));
+
+    label = TTF_RenderText_Blended(font, "Middle Aged", white);
+    SDL_BlitSurface(label, NULL, s, &(struct SDL_Rect){.x = 1, .y = WINDOW_SIZE-60, .h = 10, .w = 20});
+    SDL_FreeSurface(label);
+
+    SDL_FillRect(s, &(struct SDL_Rect){.x = 110, .y = WINDOW_SIZE-50, .h = 10, .w = bar_chart_scale*maf}, SDL_MapRGB(s->format, 0xFF, 0xFF, 0xFF));
+
+    label = TTF_RenderText_Blended(font, "Old", white);
+    SDL_BlitSurface(label, NULL, s, &(struct SDL_Rect){.x = 71, .y = WINDOW_SIZE-40, .h = 10, .w = 20});
+    SDL_FreeSurface(label);
+
+    SDL_FillRect(s, &(struct SDL_Rect){.x = 110, .y = WINDOW_SIZE-30, .h = 10, .w = bar_chart_scale*of}, SDL_MapRGB(s->format, 0xFF, 0xFF, 0xFF));
 
     SDL_UpdateWindowSurface(w);
     // SDL_Delay(50);
@@ -313,17 +348,17 @@ int main(void)
     if (stop - last_update > 1e9) {
       float this_frame = 1e9 / (stop-start);
       fps = (0.7)*this_frame - (1. - 0.7)*fps;
-      sprintf(fps_buffer, "fps: %.3f", fps);
-      surfaceMessage = TTF_RenderText_Solid(font, fps_buffer, white);
-
       fps2 = (0.7)*(1e9 / (stop_render - start)) - (1. - 0.7)*fps;
-      sprintf(fps_buffer, "fps: %.3f", fps2);
-      surfaceMessage2 = TTF_RenderText_Solid(font, fps_buffer, white);
+      sprintf(fps_buffer, "fps: %.3f, compute %.3f", fps, fps2);
+      if (surfaceMessage) SDL_FreeSurface(surfaceMessage);
+      surfaceMessage = TTF_RenderText_Blended(font, fps_buffer, white);
       last_update = stop;
     }
   }
 
+#ifdef JACK
   jack_client_close(cl);
+#endif // JACK
   SDL_DestroyWindow(w);
   SDL_Quit();
 
