@@ -10,6 +10,7 @@
 #include <stdio.h>
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
+#define MAX(x, y) ((x) < (y) ? (y) : (x))
 
 uint64_t fmix64(uint64_t k)
 {
@@ -26,13 +27,13 @@ uint64_t fmix64(uint64_t k)
 static atomic_bool running;
 
 // both square
-#define WINDOW_SIZE 1400
-#define N_CELLS     (WINDOW_SIZE/2)
+#define WINDOW_SIZE 2048
+#define N_CELLS     (WINDOW_SIZE/4)
 
 static_assert(WINDOW_SIZE % N_CELLS == 0, "Window Size must evenly divide number of cells");
 #define CELL_SIZE (WINDOW_SIZE / N_CELLS)
 
-#define MIN_LIFESPAN 501
+#define MIN_LIFESPAN 400
 #define MAX_LIFESPAN 800
 
 static struct SDL_Rect const* temp_cell_rect(int x, int y)
@@ -50,11 +51,13 @@ typedef struct {
   jack_port_t * young;
   jack_port_t * middle_aged;
   jack_port_t * old;
+  jack_port_t * ding;
 
   // volatile is technically wrong but whatever
-  volatile float * yf;  // percent
-  volatile float * maf; // percent
-  volatile float * of;  // percent
+  volatile float *  yf;  // percent
+  volatile float *  maf; // percent
+  volatile float *  of;  // percent
+  volatile double * ddt; // ??? something ???
 } args_t;
 
 static int proc_audio(jack_nframes_t nframes, void* arg)
@@ -63,11 +66,25 @@ static int proc_audio(jack_nframes_t nframes, void* arg)
   float* young       = jack_port_get_buffer(args->young,       nframes);
   float* middle_aged = jack_port_get_buffer(args->middle_aged, nframes);
   float* old         = jack_port_get_buffer(args->old,         nframes);
+  float* ding        = jack_port_get_buffer(args->ding,        nframes);
 
+  static size_t remain_one = 0;
   for (size_t i = 0; i < nframes; ++i) {
     young[i]       = *args->yf;
     middle_aged[i] = *args->maf;
     old[i]         = *args->of;
+
+    if (fabs(*args->ddt) > 0.25) {
+      remain_one = 44100/16;
+    }
+
+    if (remain_one) {
+      ding[i] = 1.0;
+      remain_one -= 1;
+    }
+    else {
+      ding[i] = 0.0;
+    }
   }
 
   return 0;
@@ -161,9 +178,10 @@ int main(void)
     return 1;
   }
 
-  volatile float ayf  = 0.0; // what a mess!
-  volatile float amaf = 0.0;
-  volatile float aof  = 0.0;
+  volatile float  ayf  = 0.0; // what a mess!
+  volatile float  amaf = 0.0;
+  volatile float  aof  = 0.0;
+  volatile double ddt  = 0.0;
 
 #ifdef JACK
   jack_client_t * cl = jack_client_open("life", JackNoStartServer, NULL);
@@ -190,14 +208,27 @@ int main(void)
     return 1;
   }
 
+  jack_port_t * ding = jack_port_register(cl, "ding", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+  if (!ding) {
+    printf("Failed to create young port\n");
+    return 1;
+  }
+
   int ret = jack_set_process_callback(cl, proc_audio, &(args_t){
       .young       = young,
       .middle_aged = middle_aged,
       .old         = old,
+      .ding        = ding,
       .yf          = &ayf,
       .maf         = &amaf,
       .of          = &aof,
-      });
+      .ddt         = &ddt,
+  });
+
+  if (ret != 0) {
+    printf("Failed to set process callback\n");
+    return 1;
+  }
 
   ret = jack_activate(cl);
   if (ret != 0) {
@@ -221,8 +252,9 @@ int main(void)
     return 1;
   }
 
+  ret = jack_connect(cl, "life:ding", "system:playback_8");
   if (ret != 0) {
-    printf("Failed to set process callback\n");
+    printf("Failed to connect\n");
     return 1;
   }
 #endif // JACK
@@ -235,8 +267,10 @@ int main(void)
   uint64_t r = 0xcafebabe;
   for (size_t i = 0; i < N_CELLS*N_CELLS; ++i) {
     r = fmix64(r ^ i);
-    arrs[which][i] = r > INT64_MAX/4;
+    arrs[which][i] = r % MAX_LIFESPAN;
   }
+
+  bool compute = false;
 
   float    fps         = 60.;
   float    fps2        = 60.;
@@ -246,25 +280,29 @@ int main(void)
   char fps_buffer[1024];
   atomic_store(&running, true);
   double average_age = MAX_LIFESPAN/2; // sort of
+  double davg_dt     = 0.0;
   while (atomic_load(&running)) {
     uint64_t start = wallclock();
     s = SDL_GetWindowSurface(w);
     SDL_FillRect(s, NULL, SDL_MapRGB(s->format, 0, 0, 0)); // make entire thing black
+    if (!compute) goto evt;
 
     float yf  = 0.0;
     float maf = 0.0;
     float of  = 0.0;
 
     size_t next = which == 1 ? 1 : 0;
+    double t_age = 0.0;
     for (size_t x = 0; x < N_CELLS; ++x) {
       for (size_t y = 0; y < N_CELLS; ++y) {
         int   n      = arrs[which][x+y*N_CELLS];
         int   mmm    = 200;
         float factor = ((float)mmm/((float)(MAX_LIFESPAN)));
         int   c      = MIN(n, MAX_LIFESPAN)*factor;
+        t_age += n;
 
-        double end_bucket_young = average_age/5;
-        double end_bucket_ma    = end_bucket_young*4;
+        double end_bucket_young = MIN(average_age/6, MIN_LIFESPAN/3);
+        double end_bucket_ma    = MAX(end_bucket_young*6, MAX_LIFESPAN/3);
 
         assert(c <= 255);
         if (n < end_bucket_young) {
@@ -286,23 +324,25 @@ int main(void)
         }
 
         arrs[next][x + y*N_CELLS] = alive_next_cycle(arrs[which], x, y);
-        average_age = (0.1)*(arrs[next][x+y*N_CELLS]) + (1 - 0.1)*average_age;
       }
     }
     yf  /= N_CELLS*N_CELLS;
     maf /= N_CELLS*N_CELLS;
     of  /= N_CELLS*N_CELLS;
 
+    double f = 0.4;
+    double n_average_age = f*(t_age/(N_CELLS*N_CELLS)) + (1 - f)*average_age;
+    f = 0.6;
+    davg_dt = f*(n_average_age-average_age) + (1-f)*davg_dt;
+    average_age = n_average_age;
+    uint64_t stop_render = wallclock();
+
     // update volatiles
     ayf  = yf;
     amaf = maf;
     aof  = of;
-    uint64_t stop_render = wallclock();
+    ddt  = davg_dt;
 
-    for (size_t x = 0; x < N_CELLS; ++x) {
-      for (size_t y = 0; y < N_CELLS; ++y) {
-      }
-    }
     which = next;
 
     if (surfaceMessage) {
@@ -314,6 +354,11 @@ int main(void)
     char b2[1024];
     sprintf(b2, "avg: %.3f", average_age);
     SDL_Surface* label = TTF_RenderText_Blended(font, b2, white);
+    SDL_BlitSurface(label, NULL, s, &(struct SDL_Rect){.x = 0, .y = WINDOW_SIZE-120, .h = 10, .w = 20});
+    SDL_FreeSurface(label);
+
+    sprintf(b2, "d/dt: %.3f", davg_dt);
+    label = TTF_RenderText_Blended(font, b2, white);
     SDL_BlitSurface(label, NULL, s, &(struct SDL_Rect){.x = 0, .y = WINDOW_SIZE-100, .h = 10, .w = 20});
     SDL_FreeSurface(label);
 
@@ -336,12 +381,14 @@ int main(void)
 
     SDL_FillRect(s, &(struct SDL_Rect){.x = 110, .y = WINDOW_SIZE-30, .h = 10, .w = bar_chart_scale*of}, SDL_MapRGB(s->format, 0xFF, 0xFF, 0xFF));
 
+evt:
     SDL_UpdateWindowSurface(w);
     // SDL_Delay(50);
 
     SDL_Event e[1];
     while (SDL_PollEvent(e)) {
       if (e->type == SDL_QUIT) atomic_store(&running, false);
+      if (e->type == SDL_KEYDOWN) compute = true;
     }
 
     uint64_t stop = wallclock();
